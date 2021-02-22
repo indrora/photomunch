@@ -3,21 +3,65 @@ package main
 // AAAAAA
 import (
 	"fmt"
-	"log"
+	"io"
+	"io/ioutil"
+	"path"
+
 	"os"
+	"path/filepath"
+	"regexp"
+
+	"github.com/rs/zerolog"
+	"github.com/rs/zerolog/log"
 
 	"github.com/cosiner/flag"
+	"github.com/rwcarlsen/goexif/exif"
 )
 
-type PhotoOpts struct {
+type photoOpts struct {
 	MoveFiles    bool     `name:"-move" usage:"Move instead of copy"`
 	IgnoreExif   bool     `name:"-ignore-exif" usage:"Ignore EXIF data"`
-	Verbose      bool     `name:"-verbose" usage:"Print Verbose Output"`
-	ImagePattern string   `name:"-filter" usage:"Regex describing filenames" default:"\\.(jpg|dng|tiff|jpeg)"`
+	Recursive    bool     `name:"-recursive" usage:"Recurse into subdirectories in source"`
+	Verbose      bool     `name:"-verbose" usage:"Print messages to log" default:"False"`
+	ImagePattern string   `name:"-filter" usage:"Regex describing filenames" default:"(?i)\\.(jpg|dng|tiff|jpeg|mpg|mp4|mov)$"`
 	Paths        []string `args:"true"`
+
+	// non-option, derived values
+	// These values are used for the processing.
+	imageRegexp regexp.Regexp // holds our regular expression
+	sourceDirs  []string      // source paths
+	destDir     string        // target directory
 }
 
-func (P *PhotoOpts) Metadata() map[string]flag.Flag {
+func copyFile(src, dest string) error {
+	// copies a file from the source to the destination, preserving as much as go will let us.
+
+	var srcfd *os.File
+	var dstfd *os.File
+	var err error
+	srcinfo, _ := os.Stat(src)
+
+	srcfd, err = os.Open(src)
+	if err != nil {
+		return err
+	}
+	dstfd, err = os.Open(dest)
+	if err != nil {
+		return err
+	}
+	defer srcfd.Close()
+	defer dstfd.Close()
+	_, err = io.Copy(dstfd, srcfd)
+	if err != nil {
+		return err
+	}
+	dstfd.Chmod(srcinfo.Mode())
+
+	return nil
+
+}
+
+func (P *photoOpts) Metadata() map[string]flag.Flag {
 	const (
 		usage   = "PhotoMunch ingests photos based on their EXIF data"
 		version = "v1"
@@ -36,11 +80,86 @@ func (P *PhotoOpts) Metadata() map[string]flag.Flag {
 	}
 }
 
+func processDirectory(sourceDir string, opts photoOpts) error {
+
+	log.Trace().Str("path", sourceDir).Msg("enter processDirectory")
+	// Check the path to validate that it's a folder.
+	stat, err := os.Stat(sourceDir)
+	if err != nil {
+		// Something went wrong, bubble up the error!
+		return err
+	} else if stat.IsDir() == false {
+		log.Fatal().
+			Str("path", sourceDir).
+			Msg("Path is not a directory.")
+	}
+	items, err := ioutil.ReadDir(sourceDir)
+	for _, file := range items {
+		fullPathName := filepath.Join(sourceDir, file.Name())
+		fileIsPhoto := opts.imageRegexp.MatchString(file.Name())
+		if fileIsPhoto == false {
+			log.Trace().
+				Str("filename", fullPathName).
+				Msg("Skipping: didn't pass regex.")
+			continue
+		}
+
+		photoTime := file.ModTime()
+		if opts.IgnoreExif == false {
+
+			photoFileReader, err := os.Open(fullPathName)
+			if err != nil {
+				log.Fatal().
+					Err(err).
+					Str("filename", file.Name()).
+					Msg("Failed to open file on disk!")
+			}
+			defer photoFileReader.Close()
+			decoder, err := exif.Decode(photoFileReader)
+			if err == nil {
+				// Use the decoder's dateTime
+				exifTime, err := decoder.DateTime()
+				if err == nil {
+					log.Trace().Msg("EXIF data loaded!")
+					photoTime = exifTime
+				} else {
+					log.Debug().Err(err).
+						Str("filename", fullPathName).
+						Msg("Failed to load EXIF date/time from EXIF source")
+				}
+			}
+		}
+		log.Info().
+			Str("filename", fullPathName).
+			Time("photoDate", photoTime).
+			Msg("Loaded photo & ready to put in destination")
+
+		// Send this file to the right place.
+		destinationDirectory := path.Join(opts.destDir, photoTime.Format("2006-01"))
+		destinationPathFull := path.Join(destinationDirectory, file.Name())
+		log.Info().
+			Str("sourceFile", fullPathName).
+			Str("destFile", destinationPathFull).
+			Msg("Copying file to destination")
+		// Make sure the destination directory exists
+		err := os.MkdirAll(destinationDirectory, 660)
+		if err != nil {
+			log.Fatal().Str("path", destinationDirectory).Err(err).Msg("Failed to create final directory")
+		}
+		err = os.Link(fullPathName, destinationPathFull)
+		if err != nil {
+			log.Fatal().Err(err).Msg("Failed to copy file")
+		}
+
+	}
+	// If at this point we had no issue, return
+	return nil
+}
+
 func main() {
-	var opts PhotoOpts
+	var opts photoOpts
 
 	// Log setup
-	log.SetPrefix("PhotoMonger: ")
 
 	// parse command line arguments
 	set := flag.NewFlagSet(flag.Flag{})
@@ -48,25 +167,35 @@ func main() {
 	set.StructFlags(&opts)
 	set.Parse()
 
+	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
+
+	zerolog.SetGlobalLevel(zerolog.InfoLevel)
+	log.Print("up and awake!")
+
+	if opts.Verbose {
+		fmt.Print("___ Setting Debug Level")
+		zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	}
+	// build the regular expression that is used
+	matchRegex, err := regexp.Compile(opts.ImagePattern)
+	opts.imageRegexp = *matchRegex
+
+	if err != nil {
+		log.Fatal().Err(err).Str("regex", opts.ImagePattern).Msg("Failed to parse file match regular expression")
+	}
+
 	// Check to make sure that there are enough sources
 	if len(opts.Paths) < 2 {
-		log.Fatal("Not enough arguments (expected 2)")
+		log.Fatal().Msg("Expected 2+ paths, got 1 or less!")
 	}
 
 	// The first part of the paths set is the sources.
-	sourceDirs := opts.Paths[:len(opts.Paths)-1]
+	opts.sourceDirs = opts.Paths[:len(opts.Paths)-1]
 	// The last element is the destination.
-	destDir := opts.Paths[len(opts.Paths)-1]
+	opts.destDir = opts.Paths[len(opts.Paths)-1]
 	// Check that the paths exist.
-	for _, sourceDir := range sourceDirs {
-		stat, err := os.Stat(sourceDir)
-		if err != nil {
-			log.Fatal(fmt.Sprintf("Path %s does not exist", sourceDir))
-		} else if stat.IsDir() == false {
-			log.Fatal(fmt.Sprintf("Path %s is not a file", sourceDir))
-		}
-		log.Printf("Source: %s ", sourceDir)
+	for _, sourceDir := range opts.sourceDirs {
+		processDirectory(sourceDir, opts)
 	}
-	log.Printf("Destination: %s", destDir)
 
 }
