@@ -2,10 +2,12 @@ package main
 
 // AAAAAA
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"path"
+	"time"
 
 	"os"
 	"path/filepath"
@@ -41,22 +43,29 @@ func copyFile(src, dest string) error {
 	var err error
 	srcinfo, _ := os.Stat(src)
 
+	if srcinfo.IsDir() {
+		return errors.New("Not a file: " + src)
+	}
+
 	srcfd, err = os.Open(src)
 	if err != nil {
 		return err
 	}
-	dstfd, err = os.Open(dest)
+	dstfd, err = os.OpenFile(dest, os.O_CREATE|os.O_WRONLY, srcinfo.Mode().Perm())
 	if err != nil {
 		return err
 	}
-	defer srcfd.Close()
-	defer dstfd.Close()
-	_, err = io.Copy(dstfd, srcfd)
+	written, err := io.Copy(dstfd, srcfd)
 	if err != nil {
 		return err
+	} else if written < srcinfo.Size() {
+		return errors.New(fmt.Sprintf("Failed to write full file. Wrote %v of %v bytes", written, srcinfo.Size()))
 	}
-	dstfd.Chmod(srcinfo.Mode())
+	srcfd.Close()
+	dstfd.Close()
+	// Set some minor things about the file
 
+	os.Chtimes(dest, time.Now(),srcinfo.ModTime())
 	return nil
 
 }
@@ -129,14 +138,14 @@ func processDirectory(sourceDir string, opts photoOpts) error {
 				}
 			}
 		}
-		log.Info().
+		log.Debug().
 			Str("filename", fullPathName).
 			Time("photoDate", photoTime).
 			Msg("Loaded photo & ready to put in destination")
 
 		// Send this file to the right place.
 		destinationDirectory := path.Join(opts.destDir, photoTime.Format("2006-01"))
-		destinationPathFull := path.Join(destinationDirectory, file.Name())
+		destinationPathFull :=  path.Join(destinationDirectory, file.Name())
 		log.Info().
 			Str("sourceFile", fullPathName).
 			Str("destFile", destinationPathFull).
@@ -146,7 +155,7 @@ func processDirectory(sourceDir string, opts photoOpts) error {
 		if err != nil {
 			log.Fatal().Str("path", destinationDirectory).Err(err).Msg("Failed to create final directory")
 		}
-		err = os.Link(fullPathName, destinationPathFull)
+		err = copyFile(fullPathName, destinationPathFull)
 		if err != nil {
 			log.Fatal().Err(err).Msg("Failed to copy file")
 		}
@@ -170,10 +179,7 @@ func main() {
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stderr})
 
 	zerolog.SetGlobalLevel(zerolog.InfoLevel)
-	log.Print("up and awake!")
-
 	if opts.Verbose {
-		fmt.Print("___ Setting Debug Level")
 		zerolog.SetGlobalLevel(zerolog.DebugLevel)
 	}
 	// build the regular expression that is used
