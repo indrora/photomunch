@@ -51,15 +51,23 @@ func copyFile(src, dest string) error {
 	// Open the source file handle. This is a read-write (though, we could make it RO)
 	srcfd, err = os.Open(src)
 	if err != nil {
+		srcfd.Close()
 		return err
 	}
-	// Open the destination file handle. This is a write-only file descriptor. 
+	// Open the destination file handle. This is a write-only file descriptor.
 	dstfd, err = os.Create(dest)
 	if err != nil {
+		srcfd.Close()
+		dstfd.Close()
 		return err
 	}
-	// Copy Do the actual copy. 
+
+	// Copy Do the actual copy.
 	written, err := io.Copy(dstfd, srcfd)
+	// And close them
+	srcfd.Close()
+	dstfd.Close()
+
 	// There are two ways this can fail:
 	// * The copy call can fail (duh)
 	// * The final number of bytes written can be unequal to the size of the source file.
@@ -68,11 +76,9 @@ func copyFile(src, dest string) error {
 	} else if written != srcinfo.Size() {
 		return errors.New(fmt.Sprintf("Failed to write full file. Wrote %v of %v bytes", written, srcinfo.Size()))
 	}
-	srcfd.Close()
-	dstfd.Close()
 	// Set some minor things about the file
 
-	os.Chtimes(dest, time.Now(),srcinfo.ModTime())
+	os.Chtimes(dest, time.Now(), srcinfo.ModTime())
 	return nil
 
 }
@@ -110,18 +116,21 @@ func processDirectory(sourceDir string, opts photoOpts, logger *zerolog.Logger) 
 			Msg("Path is not a directory.")
 	}
 	items, err := ioutil.ReadDir(sourceDir)
+	if err != nil {
+		logger.Fatal().Str("path", sourceDir).Err(err).Msg("Failed to read directory")
+	}
 	for _, file := range items {
 		fullPathName := filepath.Join(sourceDir, file.Name())
 		// If it's a directory, we can go process it.
 		if file.IsDir() {
-		    if opts.Recursive {
+			if opts.Recursive {
 				processDirectory(fullPathName, opts, logger)
 			}
 			continue
 		}
 
 		fileIsPhoto := opts.imageRegexp.MatchString(file.Name())
-		if fileIsPhoto == false {
+		if !fileIsPhoto {
 			logger.Trace().
 				Str("filename", fullPathName).
 				Msg("Skipping: didn't pass regex.")
@@ -129,7 +138,7 @@ func processDirectory(sourceDir string, opts photoOpts, logger *zerolog.Logger) 
 		}
 
 		photoTime := file.ModTime()
-		if opts.IgnoreExif == false {
+		if !opts.IgnoreExif {
 
 			photoFileReader, err := os.Open(fullPathName)
 			if err != nil {
@@ -138,7 +147,6 @@ func processDirectory(sourceDir string, opts photoOpts, logger *zerolog.Logger) 
 					Str("filename", file.Name()).
 					Msg("Failed to open file on disk!")
 			}
-			defer photoFileReader.Close()
 			decoder, err := exif.Decode(photoFileReader)
 			if err == nil {
 				// Use the decoder's dateTime
@@ -152,6 +160,8 @@ func processDirectory(sourceDir string, opts photoOpts, logger *zerolog.Logger) 
 						Msg("Failed to load EXIF date/time from EXIF source")
 				}
 			}
+			photoFileReader.Close()
+
 		}
 		logger.Debug().
 			Str("filename", fullPathName).
@@ -160,23 +170,23 @@ func processDirectory(sourceDir string, opts photoOpts, logger *zerolog.Logger) 
 
 		// Send this file to the right place.
 		destinationDirectory := path.Join(opts.destDir, photoTime.Format("2006-01"))
-		destinationPathFull :=  path.Join(destinationDirectory, file.Name())
+		destinationPathFull := path.Join(destinationDirectory, file.Name())
 		logger.Info().
 			Str("sourceFile", fullPathName).
 			Str("destFile", destinationPathFull).
 			Msg("Copying file to destination")
 		// Make sure the destination directory exists
-		err := os.MkdirAll(destinationDirectory, 660)
+		err := os.MkdirAll(destinationDirectory, 0760)
 		if err != nil {
 			logger.Fatal().Str("path", destinationDirectory).Err(err).Msg("Failed to create final directory")
 		}
-		if opts.MoveFiles { 
-			err = os.Rename(fullPathName,destinationPathFull)
-			if err != nil { 
+		if opts.MoveFiles {
+			err = os.Rename(fullPathName, destinationPathFull)
+			if err != nil {
 				logger.Error().
 					Err(err).
 					Str("sourceFile", fullPathName).
-					Str("destFile",destinationPathFull).
+					Str("destFile", destinationPathFull).
 					Msg("Failed to move target file to destination")
 			}
 		}
@@ -220,14 +230,14 @@ func main() {
 	if len(opts.Paths) < 2 {
 		log.Fatal().Msg("Expected 2+ paths, got 1 or less!")
 	}
-	log.Trace().Strs("paths",opts.Paths).Msg("Start processing")
+	log.Trace().Strs("paths", opts.Paths).Msg("Start processing")
 	// The first part of the paths set is the sources.
 	opts.sourceDirs = opts.Paths[:len(opts.Paths)-1]
 	// The last element is the destination.
 	opts.destDir = opts.Paths[len(opts.Paths)-1]
 	// Check that the paths exist.
 	for _, sourceDir := range opts.sourceDirs {
-		log.Trace().Str("sourceDir",sourceDir).Msg("start processDirectory")
+		log.Trace().Str("sourceDir", sourceDir).Msg("start processDirectory")
 		processDirectory(sourceDir, opts, &log.Logger)
 	}
 
